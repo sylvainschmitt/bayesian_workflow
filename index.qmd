@@ -1,0 +1,149 @@
+---
+title: "An example workflow"
+format:
+  html:
+    toc: true
+    self-contained: true
+    echo: true
+---
+
+```{r libraries}
+#| message: false
+library(truncnorm)
+library(rstan)
+library(knitr)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+
+# A four-step workflow Bayesian approach
+
+## Step 1:  Develop your model
+
+We realized our verbal model did not agree with the statistical model we expected to fit. We planned to fit a simple linear model, but that would assume climate change has been ongoing across all our years and that's not what most science on anthropogenic warming suggests. Instead  science (including the IPCC etc.) suggests that a large uptick in warming started around 1980. Thus we developed a `hinge' model to fit the linear regression after 1980 and a mean before 1980 (here we did this by subtracting 1980 from the predictor data). 
+This highlights an important reality throughout the workflow: effective model building is about efficient brainstorming. It's a constant back and forth between asking questions about what we know and what we should know.
+
+At the end of this step we have our conceptual model converted into its math and coded with priors in Stan:
+
+```{r model}
+cat(readLines('model.stan'), sep = '\n')
+```
+
+## Step 2: Check your model on simulated data
+
+Next we simulated data to test our model code. To do this we set the parameters in our model first, then we simulated the data  from these set parameters. In simulation, we know the `truth'---which here is a our model parameters---and we can then compare what was estimated to what we started with.
+
+First we set up the simulated test data and plot it.
+
+```{r generate}
+# Create the species-level parameters
+Nspp <- 100
+mu_doy <- 125
+sigma_doy <- 20
+mu_shift <- 0.5
+sigma_shift <- 1
+species_doy <- rnorm(Nspp, mu_doy, sigma_doy)
+species_trend <- rnorm(Nspp, mu_shift, sigma_shift)
+
+# Create the overall `error'
+sigma_y <- 5
+
+# Keep the parameters together to compare to model output
+paramsgiven <- c(mu_doy, mu_shift, sigma_shift, sigma_doy, sigma_y)
+
+# Create the data
+year_0 <- 1980
+n_data_per_species <- round(runif(Nspp, 5, 40))
+species <- rep(1:Nspp, n_data_per_species)
+N <- length(species)
+year <- rep(NA, N)
+
+for (sp in 1:Nspp){
+  year[species==sp] <- rev(2009 - 1:(n_data_per_species[sp])) - year_0
+}
+
+ypred <- length(N)
+
+for (n in 1:N){
+  s <- species[n]
+  ypred[n] <- species_doy[s] + species_trend[s]*year[n]
+}
+
+y <- rnorm(N, ypred, sigma_y)
+
+# Plot the data
+par(mar=c(3,3,1,1), mgp=c(1.5,.5,0), tck=-.01)
+plot(range(year), range(y), type="n", xlab="Year", ylab="Day of year",
+     bty="l", main="Test data")
+for (sp in 1:Nspp)
+  lines(year[species==sp], y[species==sp], col="darkblue")
+```
+
+Now that we have a simulated dataset and code for the underlying model in Stan, we can run the model on the simulated data to check how well the model returns the parameters we set.
+
+```{r test}
+fit <- stan("model.stan", data=c("N","y","Nspp","species","year"), 
+            iter=1000, chains=4, seed=377)
+
+# grep stan output
+sumer <- summary(fit)$summary
+muparams <- sumer[grep("mu", rownames(sumer)), c("mean", "2.5%", "25%", "50%", "75%", "97.5%")]
+sigmaparams <- sumer[grep("sigma", rownames(sumer)), c("mean", "2.5%","25%", "50%", "75%", "97.5%")]
+
+# compare given versus modeled
+kable(paramsgiven) # here's the parameters we set
+kable(muparams) # estimated mu parameters
+kable(sigmaparams) # estimate sigma parameters
+```
+
+We can also look at the species-level estimates. Since there are many we will plot them:
+
+```{r species_estimates}
+spslopes <- sumer[grep("b\\[", rownames(sumer)), "mean"]
+plot(spslopes~species_trend, xlab="Given species-level slopes", ylab="Modeled species-level slopes", col="darkblue")
+abline(0,1)
+```
+
+
+Next we want to consider our priors. We can start by simply plotting some of them. Below are simple histograms of the mean priors we set above for the mean intercept and slope. 
+
+```{r priors}
+#| eval: false
+par(mfrow=c(1,2))
+hist(rnorm(5000, 100,30), main="Intercept mean prior", col="lightblue")
+segments(91,25,213,25, lwd=5, col="lightblue") # April 1 to August 1
+hist(rnorm(5000, 0, 5), main="Slope (days per year) mean prior", col="lightblue")
+segments(-10,25,0,25, lwd=5, col="lightblue")
+```
+
+
+Are there reasonable? It depends on the system. In this case we know that most phenological events for data collected so far happen in the spring and summer in the northern hemisphere. We show 1 April to 1 August as darker horizontal lines on the intercept plot, and see that it captures this (and this is before the variance parameter for the intercept). Similarly previous studies on trends over time in phenological change (slope) find advances of 2-5 days per year, but sometimes higher; here we show a darker horizontal line for advances of 0 to 10 days is well within the prior and, because we are not sure directionaly for sure, we also equally allow positive numbers (though, as some point when there is enough evidence, shifting the prior more towards advances could make sense).
+
+Here we show one way to visulize what types of model output the priors allow, looking at 12 plots where we drew different possible hyperparameters for the intercept and slope from the priors:
+
+```{r slopes}
+# Let's check what the predicted slopes look like
+# Iterating over mu and sigma for intercepts and slopes
+reps <- 12
+mu_doy <- rnorm(reps, 100,30)
+sigma_doy <- rtruncnorm(a=0, b=Inf, reps, 0, 20)
+mu_shift <- rnorm(reps, 0,5)
+sigma_shift <- rtruncnorm(a=0, b=Inf, reps, 0,15)
+
+par(mfrow=c(3,4))
+par(mar=c(3,3,1,1), mgp=c(1.5,.5,0), tck=-.01)
+for(i in 1:reps){
+    plot(range(year), range(y), xlab="Year", ylab="Day of year",
+        xlim=c(-50,40),ylim=c(-50,400), type="n")
+    species_doy <- rnorm(Nspp, mu_doy[i], sigma_doy[i])
+    species_trend <- rnorm(Nspp, mu_shift[i], sigma_shift[i])
+    for(sp in 1:Nspp){
+        abline(species_doy[sp], species_trend[sp], col="lightblue")
+    }
+    abline(mu_doy[i], mu_shift[i], col="darkblue")
+}
+```
+
+
+These plots highlight the extreme variability in outcomes our model would allow. This might be far more than is realistic given what we understand currently about climate change and how species respond, but in this case we will leave the priors as they are. 
